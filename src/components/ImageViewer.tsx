@@ -28,7 +28,6 @@ export function ZoomableImage({
         className="absolute bottom-2 right-2 bg-white/90 hover:bg-white text-gray-700 p-2 rounded-full shadow border border-gray-200"
       >
         <ZoomIn className="w-4 h-4" aria-hidden="true" />
-        <span className="sr-only">Perbesar</span>
       </button>
     </div>
   )
