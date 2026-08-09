@@ -27,7 +27,7 @@ export function ZoomableImage({
         aria-label={`Perbesar gambar: ${alt}`}
         className="absolute bottom-2 right-2 bg-white/90 hover:bg-white text-gray-700 p-2 rounded-full shadow border border-gray-200"
       >
-        <ZoomIn className="w-4 h-4" aria-hidden="true" />
+        <ZoomIn className="w-5 h-5" />
       </button>
     </div>
   )
