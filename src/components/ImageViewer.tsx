@@ -21,11 +21,14 @@ export function ZoomableImage({
         className="rounded-lg border border-gray-200 max-w-full h-auto bg-white cursor-zoom-in"
         onClick={() => onOpen(src, alt)}
       />
+
+      {/* Tombol Zoom - hanya ikon */}
       <button
         type="button"
         onClick={() => onOpen(src, alt)}
         aria-label={`Perbesar gambar: ${alt}`}
-        className="absolute bottom-2 right-2 bg-white/90 hover:bg-white text-gray-700 p-2 rounded-full shadow border border-gray-200"
+        title="Perbesar gambar"
+        className="absolute bottom-2 right-2 w-10 h-10 flex items-center justify-center bg-white/90 hover:bg-white text-gray-700 rounded-full shadow border border-gray-200 transition-all duration-200 hover:scale-105"
       >
         <ZoomIn className="w-5 h-5" />
       </button>
@@ -44,35 +47,46 @@ export default function ImageLightbox({
 }) {
   useEffect(() => {
     if (!src) return
+
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        onClose()
+      }
     }
+
     window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
+
+    return () => {
+      window.removeEventListener('keydown', handler)
+    }
   }, [src, onClose])
 
   if (!src) return null
 
   return (
     <div
-      className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center p-4 animate-fade-slide"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
-      aria-label="Perbesar gambar"
+      aria-label="Pratinjau gambar"
     >
+      {/* Tombol Close */}
       <button
         type="button"
         onClick={onClose}
-        aria-label="Tutup"
-        className="absolute top-4 right-4 text-white/90 hover:text-white bg-white/10 hover:bg-white/20 rounded-full p-2"
+        aria-label="Tutup gambar"
+        title="Tutup"
+        className="absolute top-4 right-4 w-10 h-10 flex items-center justify-center rounded-full bg-white/90 hover:bg-white text-gray-700 shadow-lg transition-all duration-200 hover:scale-105"
       >
         <X className="w-6 h-6" />
       </button>
+
+      {/* Gambar */}
       <img
         src={src}
         alt={alt}
-        className="max-w-full max-h-full rounded-lg shadow-2xl"
+        className="max-w-full max-h-full rounded-lg shadow-2xl object-contain"
         onClick={(e) => e.stopPropagation()}
       />
     </div>
