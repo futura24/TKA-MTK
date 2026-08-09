@@ -1,7 +1,7 @@
 import type { Question } from '../types'
 
 // Path gambar mengacu ke /public/assets/questions/ (lihat vite public dir)
-const A = '/assets/questions'
+const A = `${import.meta.env.BASE_URL}assets/questions`.replace(/\/{2,}/g, '/')
 
 // ============================================================
 // CATATAN PENTING (lihat juga README.md):
