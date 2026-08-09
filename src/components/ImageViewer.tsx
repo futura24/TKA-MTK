@@ -25,10 +25,10 @@ export function ZoomableImage({
         type="button"
         onClick={() => onOpen(src, alt)}
         aria-label={`Perbesar gambar: ${alt}`}
-        className="absolute bottom-2 right-2 bg-white/90 hover:bg-white text-gray-700 text-xs font-medium px-2 py-1 rounded-full shadow flex items-center gap-1 border border-gray-200"
+        className="absolute bottom-2 right-2 bg-white/90 hover:bg-white text-gray-700 p-2 rounded-full shadow border border-gray-200"
       >
-        <ZoomIn className="w-3.5 h-3.5" aria-hidden="true" />
-        Perbesar
+        <ZoomIn className="w-4 h-4" aria-hidden="true" />
+        <span className="sr-only">Perbesar</span>
       </button>
     </div>
   )
