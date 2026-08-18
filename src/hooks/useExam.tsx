@@ -2,7 +2,9 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
+  useRef,
   type ReactNode,
 } from 'react'
 
@@ -17,20 +19,6 @@ import { questions } from '../data/questions'
 import { examConfig } from '../data/examConfig'
 import { useLocalStorage } from './useLocalStorage'
 import { initAnswersMap } from '../utils/questionUtils'
-
-// ============================================================
-// SUPABASE
-// ============================================================
-//
-// SESUAIKAN PATH INI jika file supabase client Anda berbeda.
-//
-// Contoh:
-// src/lib/supabase.ts
-// src/hooks/useExam.ts
-//
-// maka:
-// ../lib/supabase
-//
 import { supabase } from '../lib/supabase'
 
 // ============================================================
@@ -44,35 +32,15 @@ const KEY_CURRENT = 'tka_simulation_current_index'
 const KEY_SUBMITTED = 'tka_simulation_submitted'
 const KEY_SUBMITTED_AT = 'tka_simulation_submitted_at'
 const KEY_ATTEMPT_ID = 'tka_simulation_attempt_id'
-const KEY_RESULT = 'tka_simulation_result'
 
 // ============================================================
-// DATABASE EXAM
-// ============================================================
-//
-// Berdasarkan data Supabase Anda:
-//
-// "Simulasi TKA Matematika SMP"
-// tahun 2026
-// durasi 90 menit
-//
-const DEFAULT_EXAM_TITLE = 'Simulasi TKA Matematika SMP'
-
-// ============================================================
-// RESULT TYPE
+// CONSTANT
 // ============================================================
 
-export interface ExamResult {
-  totalQuestions: number
-  answeredCount: number
-  correctCount: number
-  wrongCount: number
-  unansweredCount: number
-  score: number
-}
+const TOTAL_QUESTIONS = questions.length
 
 // ============================================================
-// CONTEXT TYPE
+// TYPES
 // ============================================================
 
 interface ExamContextValue {
@@ -89,23 +57,18 @@ interface ExamContextValue {
   toggleMark: (questionId: number) => void
 
   currentIndex: number
-
   goToIndex: (index: number) => void
   goNext: () => void
   goPrev: () => void
 
   timing: ExamTiming | null
-
-  startExam: () => Promise<void>
+  startExam: () => void
 
   submitted: boolean
   submittedAt: number | null
-
-  submitExam: () => Promise<void>
+  submitExam: () => void
 
   attemptId: string | null
-
-  result: ExamResult | null
 
   resetSimulation: () => void
 }
@@ -117,271 +80,127 @@ interface ExamContextValue {
 const ExamContext = createContext<ExamContextValue | null>(null)
 
 // ============================================================
-// HELPER: EMPTY ANSWER
+// HELPER
 // ============================================================
 
-function createEmptyAnswerRecord(
-  questionId: number
-): AnswerRecord {
-  return {
-    questionId,
-    answer: null,
-    answered: false,
-    marked: false,
-  }
+function normalizeString(value: unknown): string {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
 }
 
-// ============================================================
-// HELPER: CEK JAWABAN KOSONG
-// ============================================================
-
-function isEmptyAnswer(
-  answer: AnswerRecord['answer']
-): boolean {
-  if (answer === null || answer === undefined) {
-    return true
-  }
-
-  if (answer === '') {
-    return true
-  }
-
-  if (Array.isArray(answer)) {
-    return answer.length === 0
-  }
-
-  if (
-    typeof answer === 'object' &&
-    answer !== null
-  ) {
-    return Object.keys(answer).length === 0
-  }
-
-  return false
-}
-
-// ============================================================
-// HELPER: NORMALISASI NILAI
-// ============================================================
-
-function normalizeValue(value: unknown): unknown {
-  if (value === null || value === undefined) {
-    return null
-  }
-
-  if (typeof value === 'string') {
-    return value.trim().toLowerCase()
-  }
-
-  if (typeof value === 'number') {
-    return value
-  }
-
-  if (typeof value === 'boolean') {
-    return value
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map(normalizeValue)
-      .sort((a, b) =>
-        JSON.stringify(a).localeCompare(
-          JSON.stringify(b)
-        )
-      )
-  }
-
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>
-
-    return Object.keys(obj)
-      .sort()
-      .reduce(
-        (result, key) => {
-          result[key] = normalizeValue(obj[key])
-          return result
-        },
-        {} as Record<string, unknown>
-      )
+function normalizeArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
   }
 
   return value
+    .map((item) => normalizeString(item))
+    .sort()
 }
 
-// ============================================================
-// HELPER: BANDINGKAN JAWABAN
-// ============================================================
-
-function answersAreEqual(
-  userAnswer: unknown,
-  correctAnswer: unknown
-): boolean {
-  return (
-    JSON.stringify(normalizeValue(userAnswer)) ===
-    JSON.stringify(normalizeValue(correctAnswer))
-  )
-}
-
-// ============================================================
-// HELPER: AMBIL KUNCI JAWABAN
-// ============================================================
-//
-// Dibuat fleksibel agar tidak langsung error jika struktur
-// questions.ts menggunakan nama:
-//
-// correctAnswer
-// answer
-// answerKey
-// correct_answer
-// key
-//
-// ============================================================
-
-function getCorrectAnswer(
-  question: unknown
-): unknown {
-  if (!question) {
-    return null
-  }
-
-  const q = question as Record<string, unknown>
-
-  const candidates = [
-    q.correctAnswer,
-    q.answer,
-    q.answerKey,
-    q.correct_answer,
-    q.correct,
-    q.key,
-  ]
-
-  for (const candidate of candidates) {
-    if (
-      candidate !== undefined &&
-      candidate !== null
-    ) {
-      return candidate
-    }
-  }
-
-  return null
-}
-
-// ============================================================
-// HELPER: DAPATKAN SUPABASE QUESTION ID
-// ============================================================
-//
-// Karena frontend Anda menggunakan questionId number,
-// sedangkan Supabase answers.question_id menggunakan UUID,
-// fungsi ini mencoba beberapa kemungkinan mapping.
-//
-// Prioritas:
-//
-// 1. ID UUID yang sudah ada di local question
-// 2. question number
-// 3. number
-// 4. order
-// 5. nomor
-// 6. fallback berdasarkan index
-//
-// ============================================================
-
-function resolveDatabaseQuestionId(
-  localQuestion: unknown,
-  databaseQuestions: Record<string, unknown>[],
-  index: number
-): string | null {
-  const local = localQuestion as Record<
-    string,
-    unknown
-  >
-
-  const localCandidates = [
-    local.supabaseId,
-    local.databaseId,
-    local.dbId,
-    local.uuid,
-    local.id,
-  ]
-
-  for (const localId of localCandidates) {
-    if (
-      localId === undefined ||
-      localId === null
-    ) {
-      continue
-    }
-
-    const found = databaseQuestions.find(
-      (dbQuestion) => {
-        return String(dbQuestion.id) === String(localId)
-      }
-    )
-
-    if (found?.id) {
-      return String(found.id)
-    }
-  }
-
-  const localNumberCandidates = [
-    local.questionNumber,
-    local.number,
-    local.order,
-    local.no,
-    local.nomor,
-  ]
-
-  const dbNumberFields = [
-    'question_number',
-    'questionNumber',
-    'number',
-    'order',
-    'no',
-    'nomor',
-  ]
-
-  for (const localNumber of localNumberCandidates) {
-    if (
-      localNumber === undefined ||
-      localNumber === null
-    ) {
-      continue
-    }
-
-    for (const dbField of dbNumberFields) {
-      const found = databaseQuestions.find(
-        (dbQuestion) =>
-          String(dbQuestion[dbField]) ===
-          String(localNumber)
-      )
-
-      if (found?.id) {
-        return String(found.id)
-      }
-    }
-  }
-
-  // Fallback berdasarkan posisi.
-  //
-  // Ini hanya digunakan jika jumlah soal database
-  // dan soal frontend sama.
-  //
+function normalizeObject(
+  value: unknown
+): Record<string, string> {
   if (
-    databaseQuestions.length ===
-    questions.length
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value)
   ) {
-    const fallback = databaseQuestions[index]
-
-    if (fallback?.id) {
-      console.warn(
-        `[TKA] Mapping question menggunakan index ${index + 1}.`
-      )
-
-      return String(fallback.id)
-    }
+    return {}
   }
 
-  return null
+  const result: Record<string, string> = {}
+
+  Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([key, val]) => {
+      result[key] = normalizeString(val)
+    })
+
+  return result
+}
+
+function answersEqual(
+  userAnswer: AnswerRecord['answer'],
+  answerKey:
+    | string
+    | string[]
+    | Record<string, string>
+    | null
+): boolean {
+  if (answerKey === null) {
+    return false
+  }
+
+  // ----------------------------------------------------------
+  // STRING
+  // ----------------------------------------------------------
+
+  if (typeof answerKey === 'string') {
+    if (typeof userAnswer === 'string') {
+      return (
+        normalizeString(userAnswer) ===
+        normalizeString(answerKey)
+      )
+    }
+
+    return false
+  }
+
+  // ----------------------------------------------------------
+  // ARRAY
+  // ----------------------------------------------------------
+
+  if (Array.isArray(answerKey)) {
+    if (!Array.isArray(userAnswer)) {
+      return false
+    }
+
+    const expected = normalizeArray(answerKey)
+    const actual = normalizeArray(userAnswer)
+
+    if (expected.length !== actual.length) {
+      return false
+    }
+
+    return expected.every(
+      (value, index) => value === actual[index]
+    )
+  }
+
+  // ----------------------------------------------------------
+  // OBJECT
+  // ----------------------------------------------------------
+
+  if (
+    typeof answerKey === 'object' &&
+    answerKey !== null
+  ) {
+    if (
+      typeof userAnswer !== 'object' ||
+      userAnswer === null ||
+      Array.isArray(userAnswer)
+    ) {
+      return false
+    }
+
+    const expected = normalizeObject(answerKey)
+    const actual = normalizeObject(userAnswer)
+
+    const expectedKeys = Object.keys(expected)
+    const actualKeys = Object.keys(actual)
+
+    if (expectedKeys.length !== actualKeys.length) {
+      return false
+    }
+
+    return expectedKeys.every(
+      (key) => expected[key] === actual[key]
+    )
+  }
+
+  return false
 }
 
 // ============================================================
@@ -394,119 +213,462 @@ export function ExamProvider({
   children: ReactNode
 }) {
   // ==========================================================
-  // IDENTITY
+  // LOCAL STATE
   // ==========================================================
 
-  const [
-    identity,
-    setIdentityState,
-  ] =
+  const [identity, setIdentityState] =
     useLocalStorage<ParticipantIdentity | null>(
       KEY_IDENTITY,
       null
     )
 
-  // ==========================================================
-  // ANSWERS
-  // ==========================================================
-
-  const [
-    answers,
-    setAnswers,
-  ] =
+  const [answers, setAnswers] =
     useLocalStorage<AnswersMap>(
       KEY_ANSWERS,
       initAnswersMap(questions)
     )
 
-  // ==========================================================
-  // TIMING
-  // ==========================================================
-
-  const [
-    timing,
-    setTiming,
-  ] =
+  const [timing, setTiming] =
     useLocalStorage<ExamTiming | null>(
       KEY_TIMING,
       null
     )
 
-  // ==========================================================
-  // CURRENT QUESTION
-  // ==========================================================
-
-  const [
-    currentIndex,
-    setCurrentIndex,
-  ] =
+  const [currentIndex, setCurrentIndex] =
     useLocalStorage<number>(
       KEY_CURRENT,
       0
     )
 
-  // ==========================================================
-  // SUBMITTED
-  // ==========================================================
-
-  const [
-    submitted,
-    setSubmitted,
-  ] =
+  const [submitted, setSubmitted] =
     useLocalStorage<boolean>(
       KEY_SUBMITTED,
       false
     )
 
-  // ==========================================================
-  // SUBMITTED AT
-  // ==========================================================
-
-  const [
-    submittedAt,
-    setSubmittedAt,
-  ] =
+  const [submittedAt, setSubmittedAt] =
     useLocalStorage<number | null>(
       KEY_SUBMITTED_AT,
       null
     )
 
-  // ==========================================================
-  // ATTEMPT ID
-  // ==========================================================
-
-  const [
-    attemptId,
-    setAttemptId,
-  ] =
+  const [attemptId, setAttemptId] =
     useLocalStorage<string | null>(
       KEY_ATTEMPT_ID,
       null
     )
 
-  // ==========================================================
-  // RESULT
-  // ==========================================================
+  // Mencegah pembuatan attempt ganda
+  const creatingAttemptRef =
+    useRef(false)
 
-  const [
-    result,
-    setResult,
-  ] =
-    useLocalStorage<ExamResult | null>(
-      KEY_RESULT,
-      null
-    )
+  // Mencegah submit ganda
+  const submittingRef =
+    useRef(false)
 
   // ==========================================================
-  // SET IDENTITY
+  // IDENTITAS
   // ==========================================================
 
   const setIdentity = useCallback(
-    (id: ParticipantIdentity) => {
-      setIdentityState(id)
+    (value: ParticipantIdentity) => {
+      setIdentityState(value)
     },
     [setIdentityState]
   )
+
+  // ==========================================================
+  // CEK JAWABAN KOSONG
+  // ==========================================================
+
+  const isAnswerEmpty = useCallback(
+    (
+      answer: AnswerRecord['answer']
+    ): boolean => {
+      if (answer === null) {
+        return true
+      }
+
+      if (answer === '') {
+        return true
+      }
+
+      if (
+        Array.isArray(answer) &&
+        answer.length === 0
+      ) {
+        return true
+      }
+
+      if (
+        typeof answer === 'object' &&
+        answer !== null &&
+        !Array.isArray(answer) &&
+        Object.keys(answer).length === 0
+      ) {
+        return true
+      }
+
+      return false
+    },
+    []
+  )
+
+  // ==========================================================
+  // CARI UUID QUESTION
+  // ==========================================================
+
+  const getSupabaseQuestionId = useCallback(
+    async (
+      questionNumber: number
+    ): Promise<string | null> => {
+      try {
+        const {
+          data,
+          error,
+        } = await supabase
+          .from('questions_public')
+          .select('id')
+          .eq(
+            'question_number',
+            questionNumber
+          )
+          .maybeSingle()
+
+        if (error) {
+          console.error(
+            `Gagal mencari UUID soal ${questionNumber}:`,
+            error
+          )
+
+          return null
+        }
+
+        if (!data?.id) {
+          console.error(
+            `Soal nomor ${questionNumber} tidak ditemukan di questions_public.`
+          )
+
+          return null
+        }
+
+        return String(data.id)
+      } catch (error) {
+        console.error(
+          `Error question ${questionNumber}:`,
+          error
+        )
+
+        return null
+      }
+    },
+    []
+  )
+
+  // ==========================================================
+  // CEK KUNCI JAWABAN LOKAL
+  // ==========================================================
+
+  const getLocalQuestion = useCallback(
+    (questionId: number) => {
+      return questions.find(
+        (question) =>
+          question.id === questionId ||
+          question.number === questionId
+      )
+    },
+    []
+  )
+
+  // ==========================================================
+  // SIMPAN JAWABAN KE SUPABASE
+  // ==========================================================
+
+  const saveAnswerToSupabase = useCallback(
+    async (
+      currentAttemptId: string,
+      questionId: number,
+      answer: AnswerRecord['answer']
+    ): Promise<boolean> => {
+      try {
+        const question =
+          getLocalQuestion(questionId)
+
+        if (!question) {
+          console.error(
+            `Question lokal ${questionId} tidak ditemukan.`
+          )
+
+          return false
+        }
+
+        const supabaseQuestionId =
+          await getSupabaseQuestionId(
+            question.number
+          )
+
+        if (!supabaseQuestionId) {
+          return false
+        }
+
+        const empty =
+          isAnswerEmpty(answer)
+
+        // ======================================================
+        // HITUNG BENAR / SALAH
+        // ======================================================
+
+        const isCorrect =
+          !empty &&
+          answersEqual(
+            answer,
+            question.answerKey
+          )
+
+        // ======================================================
+        // SIMPAN ANSWER SEBAGAI TEXT
+        //
+        // Kolom answers.answer = TEXT
+        // ======================================================
+
+        const answerText =
+          empty
+            ? null
+            : typeof answer === 'string'
+              ? answer
+              : JSON.stringify(answer)
+
+        // ======================================================
+        // CARI RECORD LAMA
+        // ======================================================
+
+        const {
+          data: existing,
+          error: findError,
+        } = await supabase
+          .from('answers')
+          .select('id')
+          .eq(
+            'attempt_id',
+            currentAttemptId
+          )
+          .eq(
+            'question_id',
+            supabaseQuestionId
+          )
+          .limit(1)
+          .maybeSingle()
+
+        if (findError) {
+          console.error(
+            `Gagal mencari answer ${questionId}:`,
+            findError
+          )
+
+          return false
+        }
+
+        // ======================================================
+        // UPDATE
+        // ======================================================
+
+        if (existing?.id) {
+          const {
+            error: updateError,
+          } = await supabase
+            .from('answers')
+            .update({
+              answer: answerText,
+              is_correct: empty
+                ? null
+                : isCorrect,
+              answered_at: new Date().toISOString(),
+            })
+            .eq(
+              'id',
+              existing.id
+            )
+
+          if (updateError) {
+            console.error(
+              `Gagal update answer ${questionId}:`,
+              updateError
+            )
+
+            return false
+          }
+
+          return true
+        }
+
+        // ======================================================
+        // INSERT
+        // ======================================================
+
+        const {
+          error: insertError,
+        } = await supabase
+          .from('answers')
+          .insert({
+            attempt_id:
+              currentAttemptId,
+
+            question_id:
+              supabaseQuestionId,
+
+            answer:
+              answerText,
+
+            is_correct:
+              empty
+                ? null
+                : isCorrect,
+
+            answered_at:
+              new Date().toISOString(),
+          })
+
+        if (insertError) {
+          console.error(
+            `Gagal insert answer ${questionId}:`,
+            insertError
+          )
+
+          return false
+        }
+
+        return true
+      } catch (error) {
+        console.error(
+          `saveAnswerToSupabase(${questionId}) error:`,
+          error
+        )
+
+        return false
+      }
+    },
+    [
+      getLocalQuestion,
+      getSupabaseQuestionId,
+      isAnswerEmpty,
+    ]
+  )
+
+  // ==========================================================
+  // HITUNG STATISTIK ATTEMPT
+  // ==========================================================
+
+  const updateAttemptStatistics =
+    useCallback(
+      async (
+        currentAttemptId: string
+      ) => {
+        try {
+          const {
+            data: answerRows,
+            error,
+          } = await supabase
+            .from('answers')
+            .select(
+              'answer, is_correct'
+            )
+            .eq(
+              'attempt_id',
+              currentAttemptId
+            )
+
+          if (error) {
+            console.error(
+              'Gagal mengambil statistik answers:',
+              error
+            )
+
+            return
+          }
+
+          const answeredCount =
+            answerRows?.filter(
+              (row) =>
+                row.answer !== null &&
+                row.answer !== ''
+            ).length ?? 0
+
+          const correctCount =
+            answerRows?.filter(
+              (row) =>
+                row.is_correct === true
+            ).length ?? 0
+
+          const wrongCount =
+            answerRows?.filter(
+              (row) =>
+                row.is_correct === false
+            ).length ?? 0
+
+          const score =
+            TOTAL_QUESTIONS > 0
+              ? Number(
+                  (
+                    (correctCount /
+                      TOTAL_QUESTIONS) *
+                    100
+                  ).toFixed(2)
+                )
+              : 0
+
+          const {
+            error: updateError,
+          } = await supabase
+            .from('attempts')
+            .update({
+              total_questions:
+                TOTAL_QUESTIONS,
+
+              answered_count:
+                answeredCount,
+
+              correct_count:
+                correctCount,
+
+              wrong_count:
+                wrongCount,
+
+              score,
+            })
+            .eq(
+              'id',
+              currentAttemptId
+            )
+
+          if (updateError) {
+            console.error(
+              'Gagal update statistik attempt:',
+              updateError
+            )
+
+            return
+          }
+
+          console.log(
+            'Statistik attempt diperbarui:',
+            {
+              totalQuestions:
+                TOTAL_QUESTIONS,
+              answeredCount,
+              correctCount,
+              wrongCount,
+              score,
+            }
+          )
+        } catch (error) {
+          console.error(
+            'updateAttemptStatistics error:',
+            error
+          )
+        }
+      },
+      []
+    )
 
   // ==========================================================
   // SET ANSWER
@@ -517,47 +679,165 @@ export function ExamProvider({
       questionId: number,
       answer: AnswerRecord['answer']
     ) => {
-      setAnswers((prev) => {
-        const prevRec =
-          prev[questionId] ??
-          createEmptyAnswerRecord(
-            questionId
-          )
+      const empty =
+        isAnswerEmpty(answer)
 
-        const empty = isEmptyAnswer(answer)
+      // --------------------------------------------------------
+      // LOCAL STORAGE
+      // --------------------------------------------------------
+
+      setAnswers((previous) => {
+        const previousRecord =
+          previous[questionId] ?? {
+            questionId,
+            answer: null,
+            answered: false,
+            marked: false,
+          }
 
         return {
-          ...prev,
+          ...previous,
+
           [questionId]: {
-            ...prevRec,
-            questionId,
+            ...previousRecord,
+
             answer,
+
             answered: !empty,
           },
         }
       })
+
+      // --------------------------------------------------------
+      // SUPABASE
+      // --------------------------------------------------------
+
+      if (
+        attemptId &&
+        !submitted
+      ) {
+        void saveAnswerToSupabase(
+          attemptId,
+          questionId,
+          answer
+        ).then(() => {
+          void updateAttemptStatistics(
+            attemptId
+          )
+        })
+      }
     },
-    [setAnswers]
+    [
+      attemptId,
+      submitted,
+      setAnswers,
+      isAnswerEmpty,
+      saveAnswerToSupabase,
+      updateAttemptStatistics,
+    ]
   )
+
+  // ==========================================================
+  // SINKRONISASI LOCAL → SUPABASE
+  // ==========================================================
+
+  useEffect(() => {
+    if (!attemptId) {
+      return
+    }
+
+    if (submitted) {
+      return
+    }
+
+    let cancelled = false
+
+    const syncAnswers =
+      async () => {
+        const answered =
+          Object.values(
+            answers
+          ).filter(
+            (record) =>
+              !isAnswerEmpty(
+                record.answer
+              )
+          )
+
+        if (
+          answered.length === 0
+        ) {
+          return
+        }
+
+        console.log(
+          `Sinkronisasi ${answered.length} jawaban...`
+        )
+
+        for (
+          const record of answered
+        ) {
+          if (cancelled) {
+            return
+          }
+
+          await saveAnswerToSupabase(
+            attemptId,
+            record.questionId,
+            record.answer
+          )
+        }
+
+        if (!cancelled) {
+          await updateAttemptStatistics(
+            attemptId
+          )
+        }
+
+        console.log(
+          'Sinkronisasi jawaban selesai.'
+        )
+      }
+
+    void syncAnswers()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    attemptId,
+    submitted,
+    answers,
+    isAnswerEmpty,
+    saveAnswerToSupabase,
+    updateAttemptStatistics,
+  ])
 
   // ==========================================================
   // TOGGLE MARK
   // ==========================================================
 
   const toggleMark = useCallback(
-    (questionId: number) => {
-      setAnswers((prev) => {
-        const prevRec =
-          prev[questionId] ??
-          createEmptyAnswerRecord(
-            questionId
-          )
+    (
+      questionId: number
+    ) => {
+      setAnswers((previous) => {
+        const previousRecord =
+          previous[questionId] ?? {
+            questionId,
+            answer: null,
+            answered: false,
+            marked: false,
+          }
 
         return {
-          ...prev,
+          ...previous,
+
           [questionId]: {
-            ...prevRec,
-            marked: !prevRec.marked,
+            ...previousRecord,
+
+            marked:
+              !previousRecord.marked,
           },
         }
       })
@@ -566,256 +846,172 @@ export function ExamProvider({
   )
 
   // ==========================================================
-  // NAVIGATION
+  // NAVIGASI
   // ==========================================================
 
   const goToIndex = useCallback(
     (index: number) => {
-      const clamped = Math.min(
-        Math.max(index, 0),
-        questions.length - 1
-      )
+      const maxIndex =
+        Math.max(
+          questions.length - 1,
+          0
+        )
 
-      setCurrentIndex(clamped)
+      const clamped =
+        Math.min(
+          Math.max(index, 0),
+          maxIndex
+        )
+
+      setCurrentIndex(
+        clamped
+      )
     },
     [setCurrentIndex]
   )
 
-  const goNext = useCallback(() => {
-    goToIndex(currentIndex + 1)
-  }, [
-    currentIndex,
-    goToIndex,
-  ])
+  const goNext =
+    useCallback(() => {
+      goToIndex(
+        currentIndex + 1
+      )
+    }, [
+      currentIndex,
+      goToIndex,
+    ])
 
-  const goPrev = useCallback(() => {
-    goToIndex(currentIndex - 1)
-  }, [
-    currentIndex,
-    goToIndex,
-  ])
-
-  // ==========================================================
-  // GET EXAM TITLE
-  // ==========================================================
-
-  const getExamTitle = useCallback(() => {
-    const config =
-      examConfig as unknown as Record<
-        string,
-        unknown
-      >
-
-    const configuredTitle =
-      config.title
-
-    if (
-      typeof configuredTitle === 'string' &&
-      configuredTitle.trim()
-    ) {
-      return configuredTitle.trim()
-    }
-
-    return DEFAULT_EXAM_TITLE
-  }, [])
+  const goPrev =
+    useCallback(() => {
+      goToIndex(
+        currentIndex - 1
+      )
+    }, [
+      currentIndex,
+      goToIndex,
+    ])
 
   // ==========================================================
-  // CREATE / FIND STUDENT
+  // CARI / BUAT STUDENT
   // ==========================================================
 
-  const getOrCreateStudent = useCallback(
-    async () => {
-      if (!identity) {
-        throw new Error(
-          'Identitas peserta belum tersedia.'
-        )
-      }
+  const getOrCreateStudent =
+    useCallback(
+      async (
+        participant: ParticipantIdentity
+      ): Promise<string | null> => {
+        // ------------------------------------------------------
+        // 1. Cari berdasarkan student_id
+        // ------------------------------------------------------
 
-      const participant =
-        identity as unknown as Record<
-          string,
-          unknown
-        >
-
-      const studentId =
-        participant.studentId ??
-        participant.nis ??
-        participant.nisn
-
-      const name =
-        participant.name ??
-        participant.nama
-
-      const school =
-        participant.school ??
-        participant.schoolName
-
-      const className =
-        participant.className ??
-        participant.class
-
-      if (
-        typeof studentId !== 'string' ||
-        !studentId.trim()
-      ) {
-        throw new Error(
-          'NIS/NISN belum tersedia.'
-        )
-      }
-
-      // --------------------------------------------------------
-      // Cari siswa
-      // --------------------------------------------------------
-
-      const {
-        data: existingStudent,
-        error: findError,
-      } = await supabase
-        .from('students')
-        .select('id, student_id, name, school, class_name')
-        .eq(
-          'student_id',
-          studentId.trim()
-        )
-        .maybeSingle()
-
-      if (findError) {
-        throw findError
-      }
-
-      if (existingStudent?.id) {
-        return existingStudent
-      }
-
-      // --------------------------------------------------------
-      // Buat siswa baru
-      // --------------------------------------------------------
-
-      const {
-        data: createdStudent,
-        error: createError,
-      } = await supabase
-        .from('students')
-        .insert({
-          name:
-            typeof name === 'string'
-              ? name.trim()
-              : 'Peserta TKA',
-
-          student_id:
-            studentId.trim(),
-
-          school:
-            typeof school === 'string'
-              ? school.trim()
-              : '',
-
-          class_name:
-            typeof className === 'string'
-              ? className.trim()
-              : '',
-        })
-        .select(
-          'id, student_id, name, school, class_name'
-        )
-        .single()
-
-      if (createError) {
-        throw createError
-      }
-
-      if (!createdStudent?.id) {
-        throw new Error(
-          'Siswa berhasil dibuat tetapi ID siswa tidak ditemukan.'
-        )
-      }
-
-      return createdStudent
-    },
-    [identity]
-  )
-
-  // ==========================================================
-  // FIND EXAM
-  // ==========================================================
-
-  const getExam = useCallback(
-    async () => {
-      const configuredTitle =
-        getExamTitle()
-
-      // --------------------------------------------------------
-      // Pertama cari berdasarkan judul persis
-      // --------------------------------------------------------
-
-      let {
-        data: exam,
-        error,
-      } = await supabase
-        .from('exams')
-        .select(
-          'id, title, year, duration_minutes, is_active'
-        )
-        .eq(
-          'title',
-          configuredTitle
-        )
-        .eq(
-          'is_active',
-          true
-        )
-        .maybeSingle()
-
-      if (error) {
-        throw error
-      }
-
-      // --------------------------------------------------------
-      // Jika tidak ditemukan, coba judul default
-      // --------------------------------------------------------
-
-      if (
-        !exam &&
-        configuredTitle !==
-          DEFAULT_EXAM_TITLE
-      ) {
-        const fallback =
-          await supabase
-            .from('exams')
-            .select(
-              'id, title, year, duration_minutes, is_active'
-            )
+        if (
+          participant.studentId
+        ) {
+          const {
+            data: existingStudent,
+            error: findError,
+          } = await supabase
+            .from('students')
+            .select('id')
             .eq(
-              'title',
-              DEFAULT_EXAM_TITLE
+              'student_id',
+              participant.studentId
             )
-            .eq(
-              'is_active',
-              true
-            )
+            .limit(1)
             .maybeSingle()
 
-        if (fallback.error) {
-          throw fallback.error
+          if (findError) {
+            console.error(
+              'Gagal mencari student:',
+              findError
+            )
+
+            return null
+          }
+
+          if (
+            existingStudent?.id
+          ) {
+            return String(
+              existingStudent.id
+            )
+          }
         }
 
-        exam = fallback.data
-      }
+        // ------------------------------------------------------
+        // 2. Buat student baru
+        // ------------------------------------------------------
 
-      // --------------------------------------------------------
-      // Coba ilike
-      // --------------------------------------------------------
+        const {
+          data: newStudent,
+          error: insertError,
+        } = await supabase
+          .from('students')
+          .insert({
+            name:
+              participant.name,
 
-      if (!exam) {
-        const fallback =
-          await supabase
+            student_id:
+              participant.studentId,
+
+            school:
+              participant.school,
+
+            class_name:
+              participant.className,
+          })
+          .select('id')
+          .single()
+
+        if (insertError) {
+          console.error(
+            'Gagal membuat student:',
+            insertError
+          )
+
+          return null
+        }
+
+        if (!newStudent?.id) {
+          console.error(
+            'Student dibuat tetapi ID tidak tersedia.'
+          )
+
+          return null
+        }
+
+        return String(
+          newStudent.id
+        )
+      },
+      []
+    )
+
+  // ==========================================================
+  // CARI EXAM
+  // ==========================================================
+
+  const getExamId =
+    useCallback(
+      async (): Promise<
+        string | null
+      > => {
+        try {
+          // ----------------------------------------------------
+          // Prioritas 1:
+          // title + active
+          // ----------------------------------------------------
+
+          const {
+            data: activeExam,
+            error: activeError,
+          } = await supabase
             .from('exams')
             .select(
               'id, title, year, duration_minutes, is_active'
             )
-            .ilike(
+            .eq(
               'title',
-              configuredTitle
+              examConfig.title
             )
             .eq(
               'is_active',
@@ -824,762 +1020,537 @@ export function ExamProvider({
             .limit(1)
             .maybeSingle()
 
-        if (fallback.error) {
-          throw fallback.error
-        }
-
-        exam = fallback.data
-      }
-
-      if (!exam?.id) {
-        throw new Error(
-          `UJIAN TIDAK DITEMUKAN: "${configuredTitle}"`
-        )
-      }
-
-      return exam
-    },
-    [getExamTitle]
-  )
-
-  // ==========================================================
-  // START EXAM
-  // ==========================================================
-
-  const startExam = useCallback(
-    async () => {
-      try {
-        console.log(
-          '========================================'
-        )
-        console.log(
-          'MEMULAI UJIAN TKA'
-        )
-        console.log(
-          '========================================'
-        )
-
-        // ------------------------------------------------------
-        // Jangan membuat attempt baru jika attempt lama
-        // masih aktif.
-        // ------------------------------------------------------
-
-        if (
-          attemptId &&
-          !submitted
-        ) {
-          console.log(
-            'Attempt masih aktif:',
-            attemptId
-          )
-
-          if (!timing) {
-            const now = Date.now()
-
-            setTiming({
-              startTime: now,
-              endTime:
-                now +
-                examConfig.durationSeconds *
-                  1000,
-            })
-          }
-
-          return
-        }
-
-        // ------------------------------------------------------
-        // Reset jawaban untuk ujian baru
-        // ------------------------------------------------------
-
-        setAnswers(
-          initAnswersMap(questions)
-        )
-
-        setResult(null)
-        setSubmitted(false)
-        setSubmittedAt(null)
-        setCurrentIndex(0)
-
-        // ------------------------------------------------------
-        // Waktu ujian
-        // ------------------------------------------------------
-
-        const now = Date.now()
-
-        const newTiming: ExamTiming = {
-          startTime: now,
-          endTime:
-            now +
-            examConfig.durationSeconds *
-              1000,
-        }
-
-        setTiming(newTiming)
-
-        // ------------------------------------------------------
-        // Jika identity belum ada, tetap jalankan lokal.
-        // ------------------------------------------------------
-
-        if (!identity) {
-          console.warn(
-            '[TKA] Identity belum tersedia. Attempt Supabase tidak dibuat.'
-          )
-
-          setAttemptId(null)
-
-          return
-        }
-
-        // ------------------------------------------------------
-        // Cari / buat student
-        // ------------------------------------------------------
-
-        console.log(
-          'Mencari / membuat siswa...'
-        )
-
-        const student =
-          await getOrCreateStudent()
-
-        console.log(
-          'Student ID:',
-          student.id
-        )
-
-        // ------------------------------------------------------
-        // Cari exam
-        // ------------------------------------------------------
-
-        console.log(
-          'Mencari exam:',
-          getExamTitle()
-        )
-
-        const exam =
-          await getExam()
-
-        console.log(
-          'Exam ID:',
-          exam.id
-        )
-
-        // ------------------------------------------------------
-        // Buat attempt
-        // ------------------------------------------------------
-
-        console.log(
-          'Membuat attempt Supabase...'
-        )
-
-        const {
-          data: newAttempt,
-          error: attemptError,
-        } = await supabase
-          .from('attempts')
-          .insert({
-            student_id: student.id,
-            exam_id: exam.id,
-            started_at:
-              new Date().toISOString(),
-          })
-          .select('id')
-          .single()
-
-        if (attemptError) {
-          throw attemptError
-        }
-
-        if (!newAttempt?.id) {
-          throw new Error(
-            'Attempt berhasil dibuat tetapi ID tidak ditemukan.'
-          )
-        }
-
-        setAttemptId(
-          String(newAttempt.id)
-        )
-
-        console.log(
-          'ATTEMPT BERHASIL DIBUAT:',
-          newAttempt.id
-        )
-      } catch (error) {
-        console.error(
-          '========================================'
-        )
-
-        console.error(
-          'GAGAL MEMBUAT ATTEMPT SUPABASE'
-        )
-
-        console.error(error)
-
-        console.error(
-          'Ujian tetap dilanjutkan secara lokal.'
-        )
-
-        console.error(
-          '========================================'
-        )
-
-        // ------------------------------------------------------
-        // Jangan membuat peserta tidak bisa ujian hanya karena
-        // backend gagal.
-        // ------------------------------------------------------
-
-        setAttemptId(null)
-      }
-    },
-    [
-      attemptId,
-      submitted,
-      timing,
-      identity,
-      getOrCreateStudent,
-      getExam,
-      getExamTitle,
-      setAnswers,
-      setResult,
-      setSubmitted,
-      setSubmittedAt,
-      setCurrentIndex,
-      setTiming,
-      setAttemptId,
-    ]
-  )
-
-  // ==========================================================
-  // CALCULATE LOCAL RESULT
-  // ==========================================================
-
-  const calculateLocalResult =
-    useCallback((): ExamResult => {
-      const totalQuestions =
-        questions.length
-
-      let answeredCount = 0
-      let correctCount = 0
-      let wrongCount = 0
-
-      questions.forEach(
-        (question, index) => {
-          const localQuestion =
-            question as unknown as Record<
-              string,
-              unknown
-            >
-
-          const questionId =
-            Number(localQuestion.id)
-
-          const answerRecord =
-            answers[questionId]
-
           if (
-            !answerRecord ||
-            !answerRecord.answered
+            activeError
           ) {
-            return
-          }
-
-          answeredCount++
-
-          const correctAnswer =
-            getCorrectAnswer(
-              question
+            console.error(
+              'Gagal mencari exam aktif:',
+              activeError
             )
-
-          const isCorrect =
-            answersAreEqual(
-              answerRecord.answer,
-              correctAnswer
-            )
-
-          if (isCorrect) {
-            correctCount++
-          } else {
-            wrongCount++
-          }
-
-          // Hindari warning unused index pada beberapa
-          // konfigurasi TypeScript.
-          void index
-        }
-      )
-
-      const unansweredCount =
-        Math.max(
-          0,
-          totalQuestions -
-            answeredCount
-        )
-
-      const score =
-        totalQuestions > 0
-          ? Number(
-              (
-                (correctCount /
-                  totalQuestions) *
-                100
-              ).toFixed(2)
-            )
-          : 0
-
-      return {
-        totalQuestions,
-        answeredCount,
-        correctCount,
-        wrongCount,
-        unansweredCount,
-        score,
-      }
-    }, [answers])
-
-  // ==========================================================
-  // LOAD DATABASE QUESTIONS
-  // ==========================================================
-
-  const loadDatabaseQuestions =
-    useCallback(async () => {
-      const {
-        data,
-        error,
-      } = await supabase
-        .from('questions_public')
-        .select('*')
-
-      if (error) {
-        throw error
-      }
-
-      return (
-        (data ?? []) as Record<
-          string,
-          unknown
-        >[]
-      )
-    }, [])
-
-  // ==========================================================
-  // SAVE ANSWERS TO SUPABASE
-  // ==========================================================
-
-  const saveAnswersToSupabase =
-    useCallback(
-      async (
-        currentAttemptId: string
-      ) => {
-        console.log(
-          'Menyimpan jawaban ke Supabase...'
-        )
-
-        // ------------------------------------------------------
-        // Ambil questions dari database
-        // ------------------------------------------------------
-
-        let databaseQuestions:
-          Record<
-            string,
-            unknown
-          >[] = []
-
-        try {
-          databaseQuestions =
-            await loadDatabaseQuestions()
-        } catch (error) {
-          console.warn(
-            '[TKA] Tidak dapat mengambil questions_public:',
-            error
-          )
-        }
-
-        // ------------------------------------------------------
-        // Ambil answer yang sudah ada
-        // ------------------------------------------------------
-
-        const {
-          data: existingAnswers,
-          error: existingError,
-        } = await supabase
-          .from('answers')
-          .select(
-            'id, attempt_id, question_id, answer, is_correct'
-          )
-          .eq(
-            'attempt_id',
-            currentAttemptId
-          )
-
-        if (existingError) {
-          throw existingError
-        }
-
-        // ------------------------------------------------------
-        // Proses setiap soal
-        // ------------------------------------------------------
-
-        for (
-          let index = 0;
-          index < questions.length;
-          index++
-        ) {
-          const question =
-            questions[index]
-
-          const local =
-            question as unknown as Record<
-              string,
-              unknown
-            >
-
-          const localQuestionId =
-            Number(local.id)
-
-          const answerRecord =
-            answers[localQuestionId]
-
-          const correctAnswer =
-            getCorrectAnswer(
-              question
-            )
-
-          const hasAnswer =
-            Boolean(
-              answerRecord?.answered
-            )
-
-          const userAnswer =
-            hasAnswer
-              ? answerRecord.answer
-              : null
-
-          const isCorrect =
-            hasAnswer &&
-            answersAreEqual(
-              userAnswer,
-              correctAnswer
-            )
-
-          // ----------------------------------------------------
-          // Cari question UUID database
-          // ----------------------------------------------------
-
-          let databaseQuestionId =
-            resolveDatabaseQuestionId(
-              question,
-              databaseQuestions,
-              index
-            )
-
-          // ----------------------------------------------------
-          // Jika belum ditemukan, coba dari answer existing
-          // berdasarkan urutan
-          // ----------------------------------------------------
-
-          if (
-            !databaseQuestionId &&
-            existingAnswers &&
-            existingAnswers[index]
-          ) {
-            databaseQuestionId =
-              String(
-                existingAnswers[index]
-                  .question_id
-              )
           }
 
           if (
-            !databaseQuestionId
+            activeExam?.id
           ) {
-            console.warn(
-              `[TKA] Question ${index + 1} tidak memiliki mapping UUID Supabase.`
+            console.log(
+              'Exam ditemukan:',
+              activeExam
             )
 
-            continue
+            return String(
+              activeExam.id
+            )
           }
 
           // ----------------------------------------------------
-          // Cari existing answer
-          // ----------------------------------------------------
-
-          const existing =
-            existingAnswers?.find(
-              (item) =>
-                String(
-                  item.question_id
-                ) ===
-                String(
-                  databaseQuestionId
-                )
-            )
-
-          // ----------------------------------------------------
-          // UPDATE jika sudah ada
-          // ----------------------------------------------------
-
-          if (existing?.id) {
-            const {
-              error: updateError,
-            } = await supabase
-              .from('answers')
-              .update({
-                answer: hasAnswer
-                  ? userAnswer
-                  : null,
-                is_correct:
-                  hasAnswer
-                    ? isCorrect
-                    : false,
-              })
-              .eq(
-                'id',
-                existing.id
-              )
-
-            if (updateError) {
-              console.error(
-                `[TKA] Gagal update answer soal ${index + 1}:`,
-                updateError
-              )
-            }
-
-            continue
-          }
-
-          // ----------------------------------------------------
-          // INSERT jika belum ada
+          // Prioritas 2:
+          // title saja
+          //
+          // Digunakan jika is_active belum sesuai.
           // ----------------------------------------------------
 
           const {
-            error: insertError,
+            data: examByTitle,
+            error: titleError,
           } = await supabase
-            .from('answers')
-            .insert({
-              attempt_id:
-                currentAttemptId,
+            .from('exams')
+            .select(
+              'id, title, year, duration_minutes, is_active'
+            )
+            .eq(
+              'title',
+              examConfig.title
+            )
+            .order(
+              'year',
+              {
+                ascending: false,
+              }
+            )
+            .limit(1)
+            .maybeSingle()
 
-              question_id:
-                databaseQuestionId,
-
-              answer:
-                hasAnswer
-                  ? userAnswer
-                  : null,
-
-              is_correct:
-                hasAnswer
-                  ? isCorrect
-                  : false,
-            })
-
-          if (insertError) {
+          if (
+            titleError
+          ) {
             console.error(
-              `[TKA] Gagal insert answer soal ${index + 1}:`,
-              insertError
+              'Gagal mencari exam berdasarkan title:',
+              titleError
+            )
+
+            return null
+          }
+
+          if (
+            examByTitle?.id
+          ) {
+            console.warn(
+              'Exam ditemukan tetapi is_active bukan TRUE:',
+              examByTitle
+            )
+
+            return String(
+              examByTitle.id
             )
           }
-        }
 
-        console.log(
-          'Semua jawaban selesai disinkronkan.'
-        )
-      },
-      [
-        answers,
-        loadDatabaseQuestions,
-      ]
-    )
-
-  // ==========================================================
-  // UPDATE ATTEMPT RESULT
-  // ==========================================================
-
-  const updateAttemptResult =
-    useCallback(
-      async (
-        currentAttemptId: string,
-        finalResult: ExamResult
-      ) => {
-        const {
-          error,
-        } = await supabase
-          .from('attempts')
-          .update({
-            submitted_at:
-              new Date().toISOString(),
-
-            total_questions:
-              finalResult.totalQuestions,
-
-            answered_count:
-              finalResult.answeredCount,
-
-            correct_count:
-              finalResult.correctCount,
-
-            wrong_count:
-              finalResult.wrongCount,
-
-            score:
-              finalResult.score,
-          })
-          .eq(
-            'id',
-            currentAttemptId
+          console.error(
+            'UJIAN TIDAK DITEMUKAN.',
+            {
+              expectedTitle:
+                examConfig.title,
+            }
           )
 
-        if (error) {
-          throw error
+          return null
+        } catch (error) {
+          console.error(
+            'getExamId error:',
+            error
+          )
+
+          return null
         }
-
-        console.log(
-          'Attempt berhasil diperbarui:',
-          {
-            attemptId:
-              currentAttemptId,
-
-            ...finalResult,
-          }
-        )
       },
       []
     )
 
   // ==========================================================
-  // SUBMIT EXAM
+  // BUAT ATTEMPT SUPABASE
   // ==========================================================
 
-  const submitExam = useCallback(
-    async () => {
-      if (submitted) {
-        console.log(
-          '[TKA] Submit diabaikan karena ujian sudah submit.'
-        )
+  const createSupabaseAttempt =
+    useCallback(
+      async (): Promise<
+        string | null
+      > => {
+        if (!identity) {
+          console.warn(
+            'Identitas peserta belum tersedia.'
+          )
 
-        return
-      }
+          return null
+        }
 
-      console.log(
-        '========================================'
-      )
+        if (
+          creatingAttemptRef.current
+        ) {
+          console.warn(
+            'Attempt sedang dibuat.'
+          )
 
-      console.log(
-        'SUBMIT UJIAN TKA'
-      )
+          return null
+        }
 
-      console.log(
-        '========================================'
-      )
+        creatingAttemptRef.current =
+          true
 
-      // ------------------------------------------------------
-      // Hitung hasil lokal terlebih dahulu
-      // ------------------------------------------------------
+        try {
+          console.log(
+            '======================================'
+          )
 
-      const finalResult =
-        calculateLocalResult()
+          console.log(
+            'MEMULAI PEMBUATAN ATTEMPT SUPABASE'
+          )
 
-      console.log(
-        'HASIL LOKAL:',
-        finalResult
-      )
+          console.log(
+            'Identitas:',
+            identity
+          )
 
-      // ------------------------------------------------------
-      // Simpan lokal
-      // ------------------------------------------------------
+          // ----------------------------------------------------
+          // STUDENT
+          // ----------------------------------------------------
 
-      setResult(
-        finalResult
-      )
+          const studentId =
+            await getOrCreateStudent(
+              identity
+            )
 
-      setSubmitted(
-        true
-      )
+          if (!studentId) {
+            console.error(
+              'Student gagal dibuat/ditemukan.'
+            )
 
-      const finalSubmittedAt =
-        Date.now()
+            return null
+          }
 
-      setSubmittedAt(
-        finalSubmittedAt
-      )
+          console.log(
+            'Student UUID:',
+            studentId
+          )
 
-      // ------------------------------------------------------
-      // Jika tidak ada attempt Supabase
-      // ------------------------------------------------------
+          // ----------------------------------------------------
+          // EXAM
+          // ----------------------------------------------------
 
-      if (!attemptId) {
+          const examId =
+            await getExamId()
+
+          if (!examId) {
+            console.error(
+              'Exam UUID tidak ditemukan.'
+            )
+
+            return null
+          }
+
+          console.log(
+            'Exam UUID:',
+            examId
+          )
+
+          // ----------------------------------------------------
+          // ATTEMPT
+          // ----------------------------------------------------
+
+          const startedAt =
+            new Date().toISOString()
+
+          const {
+            data: newAttempt,
+            error: attemptError,
+          } = await supabase
+            .from('attempts')
+            .insert({
+              student_id:
+                studentId,
+
+              exam_id:
+                examId,
+
+              started_at:
+                startedAt,
+
+              total_questions:
+                TOTAL_QUESTIONS,
+
+              answered_count:
+                0,
+
+              correct_count:
+                0,
+
+              wrong_count:
+                0,
+
+              score:
+                0,
+            })
+            .select('id')
+            .single()
+
+          if (
+            attemptError
+          ) {
+            console.error(
+              '======================================'
+            )
+
+            console.error(
+              'GAGAL MEMBUAT ATTEMPT'
+            )
+
+            console.error(
+              'code:',
+              attemptError.code
+            )
+
+            console.error(
+              'message:',
+              attemptError.message
+            )
+
+            console.error(
+              'details:',
+              attemptError.details
+            )
+
+            console.error(
+              'hint:',
+              attemptError.hint
+            )
+
+            console.error(
+              '======================================'
+            )
+
+            return null
+          }
+
+          if (
+            !newAttempt?.id
+          ) {
+            console.error(
+              'Attempt dibuat tetapi ID tidak dikembalikan.'
+            )
+
+            return null
+          }
+
+          console.log(
+            'ATTEMPT BERHASIL DIBUAT:',
+            newAttempt.id
+          )
+
+          return String(
+            newAttempt.id
+          )
+        } catch (error) {
+          console.error(
+            'createSupabaseAttempt error:',
+            error
+          )
+
+          return null
+        } finally {
+          creatingAttemptRef.current =
+            false
+        }
+      },
+      [
+        identity,
+        getOrCreateStudent,
+        getExamId,
+      ]
+    )
+
+  // ==========================================================
+  // MULAI UJIAN
+  // ==========================================================
+
+  const startExam =
+    useCallback(() => {
+      // Jangan membuat attempt baru
+      // jika attempt sedang aktif.
+      if (
+        attemptId &&
+        !submitted
+      ) {
         console.warn(
-          '[TKA] Tidak ada attempt_id Supabase.'
-        )
-
-        console.log(
-          '[TKA] Hasil tetap tersedia secara lokal.'
-        )
-
-        return
-      }
-
-      // ------------------------------------------------------
-      // Simpan ke Supabase
-      // ------------------------------------------------------
-
-      try {
-        // 1. Simpan semua answers
-        await saveAnswersToSupabase(
+          'Attempt masih aktif:',
           attemptId
         )
 
-        // 2. Update attempt
-        await updateAttemptResult(
-          attemptId,
-          finalResult
-        )
-
-        console.log(
-          '========================================'
-        )
-
-        console.log(
-          'SUBMIT SUPABASE BERHASIL'
-        )
-
-        console.log(
-          '========================================'
-        )
-      } catch (error) {
-        console.error(
-          '========================================'
-        )
-
-        console.error(
-          'GAGAL SUBMIT KE SUPABASE'
-        )
-
-        console.error(error)
-
-        console.error(
-          'Hasil lokal tetap tersimpan.'
-        )
-
-        console.error(
-          '========================================'
-        )
+        return
       }
-    },
-    [
-      submitted,
+
+      const now =
+        Date.now()
+
+      // --------------------------------------------------------
+      // Reset status
+      // --------------------------------------------------------
+
+      setSubmitted(false)
+      setSubmittedAt(null)
+      setCurrentIndex(0)
+      setAttemptId(null)
+
+      // --------------------------------------------------------
+      // Reset jawaban
+      // --------------------------------------------------------
+
+      setAnswers(
+        initAnswersMap(
+          questions
+        )
+      )
+
+      // --------------------------------------------------------
+      // Timer
+      // --------------------------------------------------------
+
+      setTiming({
+        startTime:
+          now,
+
+        endTime:
+          now +
+          examConfig.durationSeconds *
+            1000,
+      })
+
+      // --------------------------------------------------------
+      // Buat attempt
+      // --------------------------------------------------------
+
+      void (async () => {
+        console.log(
+          'Mulai membuat attempt...'
+        )
+
+        const newAttemptId =
+          await createSupabaseAttempt()
+
+        if (
+          !newAttemptId
+        ) {
+          console.error(
+            'ATTEMPT SUPABASE GAGAL DIBUAT.'
+          )
+
+          return
+        }
+
+        setAttemptId(
+          newAttemptId
+        )
+
+        console.log(
+          'Attempt ID tersimpan:',
+          newAttemptId
+        )
+      })()
+    }, [
       attemptId,
-      calculateLocalResult,
-      saveAnswersToSupabase,
-      updateAttemptResult,
-      setResult,
+      submitted,
       setSubmitted,
       setSubmittedAt,
-    ]
-  )
+      setCurrentIndex,
+      setAttemptId,
+      setAnswers,
+      setTiming,
+      createSupabaseAttempt,
+    ])
 
   // ==========================================================
-  // RESET SIMULATION
+  // SUBMIT UJIAN
+  // ==========================================================
+
+  const submitExam =
+    useCallback(() => {
+      if (
+        submittingRef.current
+      ) {
+        return
+      }
+
+      submittingRef.current =
+        true
+
+      const timestamp =
+        Date.now()
+
+      setSubmitted(true)
+      setSubmittedAt(
+        timestamp
+      )
+
+      if (!attemptId) {
+        console.warn(
+          'Tidak ada attempt_id. Submit hanya tersimpan lokal.'
+        )
+
+        submittingRef.current =
+          false
+
+        return
+      }
+
+      void (async () => {
+        try {
+          // ----------------------------------------------------
+          // Sinkronisasi seluruh jawaban terakhir
+          // ----------------------------------------------------
+
+          const answered =
+            Object.values(
+              answers
+            ).filter(
+              (record) =>
+                !isAnswerEmpty(
+                  record.answer
+                )
+            )
+
+          for (
+            const record of answered
+          ) {
+            await saveAnswerToSupabase(
+              attemptId,
+              record.questionId,
+              record.answer
+            )
+          }
+
+          // ----------------------------------------------------
+          // Hitung statistik
+          // ----------------------------------------------------
+
+          await updateAttemptStatistics(
+            attemptId
+          )
+
+          // ----------------------------------------------------
+          // Submit attempt
+          // ----------------------------------------------------
+
+          const {
+            error: submitError,
+          } = await supabase
+            .from('attempts')
+            .update({
+              submitted_at:
+                new Date(
+                  timestamp
+                ).toISOString(),
+            })
+            .eq(
+              'id',
+              attemptId
+            )
+
+          if (
+            submitError
+          ) {
+            console.error(
+              'Gagal submit attempt:',
+              submitError
+            )
+
+            return
+          }
+
+          console.log(
+            '======================================'
+          )
+
+          console.log(
+            'ATTEMPT BERHASIL DISUBMIT'
+          )
+
+          console.log(
+            'Attempt:',
+            attemptId
+          )
+
+          console.log(
+            '======================================'
+          )
+        } catch (error) {
+          console.error(
+            'submitExam error:',
+            error
+          )
+        } finally {
+          submittingRef.current =
+            false
+        }
+      })()
+    }, [
+      attemptId,
+      answers,
+      isAnswerEmpty,
+      saveAnswerToSupabase,
+      updateAttemptStatistics,
+      setSubmitted,
+      setSubmittedAt,
+    ])
+
+  // ==========================================================
+  // RESET SIMULASI
   // ==========================================================
 
   const resetSimulation =
@@ -1588,41 +1559,29 @@ export function ExamProvider({
         'Reset simulasi...'
       )
 
-      setIdentityState(
-        null
-      )
+      setIdentityState(null)
 
       setAnswers(
-        initAnswersMap(questions)
+        initAnswersMap(
+          questions
+        )
       )
 
-      setTiming(
-        null
-      )
+      setTiming(null)
 
-      setCurrentIndex(
-        0
-      )
+      setCurrentIndex(0)
 
-      setSubmitted(
+      setSubmitted(false)
+
+      setSubmittedAt(null)
+
+      setAttemptId(null)
+
+      creatingAttemptRef.current =
         false
-      )
 
-      setSubmittedAt(
-        null
-      )
-
-      setAttemptId(
-        null
-      )
-
-      setResult(
-        null
-      )
-
-      console.log(
-        'Reset simulasi selesai.'
-      )
+      submittingRef.current =
+        false
     }, [
       setIdentityState,
       setAnswers,
@@ -1631,7 +1590,6 @@ export function ExamProvider({
       setSubmitted,
       setSubmittedAt,
       setAttemptId,
-      setResult,
     ])
 
   // ==========================================================
@@ -1671,34 +1629,34 @@ export function ExamProvider({
 
         attemptId,
 
-        result,
-
         resetSimulation,
       }),
       [
         identity,
         setIdentity,
+
         answers,
         setAnswer,
+
         toggleMark,
+
         currentIndex,
         goToIndex,
         goNext,
         goPrev,
+
         timing,
         startExam,
+
         submitted,
         submittedAt,
         submitExam,
+
         attemptId,
-        result,
+
         resetSimulation,
       ]
     )
-
-  // ==========================================================
-  // PROVIDER
-  // ==========================================================
 
   return (
     <ExamContext.Provider
@@ -1710,20 +1668,20 @@ export function ExamProvider({
 }
 
 // ============================================================
-// USE EXAM
+// HOOK
 // ============================================================
 
 export function useExam() {
-  const ctx =
+  const context =
     useContext(
       ExamContext
     )
 
-  if (!ctx) {
+  if (!context) {
     throw new Error(
       'useExam harus dipakai di dalam <ExamProvider>'
     )
   }
 
-  return ctx
+  return context
 }
